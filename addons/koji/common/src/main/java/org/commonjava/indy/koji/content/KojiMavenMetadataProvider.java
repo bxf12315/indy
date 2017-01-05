@@ -18,6 +18,7 @@ package org.commonjava.indy.koji.content;
 import com.redhat.red.build.koji.KojiClient;
 import com.redhat.red.build.koji.KojiClientException;
 import com.redhat.red.build.koji.model.xmlrpc.KojiArchiveInfo;
+import com.redhat.red.build.koji.model.xmlrpc.KojiBuildArchiveCollection;
 import com.redhat.red.build.koji.model.xmlrpc.KojiBuildInfo;
 import com.redhat.red.build.koji.model.xmlrpc.KojiTagInfo;
 import org.apache.maven.artifact.repository.metadata.Metadata;
@@ -46,6 +47,7 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -97,18 +99,23 @@ public class KojiMavenMetadataProvider
     public Metadata getMetadata( StoreKey targetKey, String path )
             throws IndyWorkflowException
     {
+        Logger logger = LoggerFactory.getLogger( getClass() );
+
         if ( group != targetKey.getType() )
         {
+            logger.debug( "Not a group. Cannot supplement with metadata from Koji builds" );
             return null;
         }
 
         if ( !kojiConfig.isEnabled() )
         {
+            logger.debug( "Koji add-on is disabled." );
             return null;
         }
 
         if ( !kojiConfig.isEnabledFor( targetKey.getName() ) )
         {
+            logger.debug( "Koji integration is not enabled for group: {}", targetKey );
             return null;
         }
 
@@ -118,6 +125,7 @@ public class KojiMavenMetadataProvider
 
         if ( artifactDir == null || groupDir == null )
         {
+            logger.debug( "Invalid groupId / artifactId directory structure: '{}' / '{}'", groupDir, artifactDir );
             return null;
         }
 
@@ -131,12 +139,12 @@ public class KojiMavenMetadataProvider
         }
         catch ( InvalidRefException e )
         {
-            Logger logger = LoggerFactory.getLogger( getClass() );
             logger.debug( "Not a valid Maven GA: {}:{}. Skipping Koji metadata retrieval.", groupId, artifactId );
         }
 
         if ( ga == null )
         {
+            logger.debug( "Could not render a valid Maven GA for path: '{}'", path );
             return null;
         }
 
@@ -165,11 +173,14 @@ public class KojiMavenMetadataProvider
             ProjectRef ref = ga;
             if ( metadata == null )
             {
-                Logger logger = LoggerFactory.getLogger( getClass() );
-
                 try
                 {
                     metadata = kojiClient.withKojiSession( ( session ) -> {
+
+                        // short-term caches to help improve performance a bit by avoiding xml-rpc calls.
+                        Map<Integer, KojiBuildArchiveCollection> seenBuildArchives = new HashMap<>();
+                        Map<Integer, KojiBuildInfo> seenBuilds = new HashMap<>();
+                        Map<Integer, List<KojiTagInfo>> seenBuildTags = new HashMap<>();
 
                         List<KojiArchiveInfo> archives = kojiClient.listArchivesMatching( ref, session );
 
@@ -178,12 +189,20 @@ public class KojiMavenMetadataProvider
                         {
                             if ( !archive.getFilename().endsWith( ".pom" ) )
                             {
+                                logger.debug( "Skipping non-POM: {}", archive.getFilename() );
                                 continue;
                             }
 
-                            KojiBuildInfo build = kojiClient.getBuildInfo( archive.getBuildId(), session );
+                            KojiBuildInfo build = seenBuilds.get(archive.getBuildId());
+                            if( build == null ){
+                                build = kojiClient.getBuildInfo( archive.getBuildId(), session );
+                                seenBuilds.put( archive.getBuildId(), build );
+                            }
+
                             if ( build == null )
                             {
+                                logger.debug( "Cannot retrieve build info: {}. Skipping: {}", archive.getBuildId(),
+                                              archive.getFilename() );
                                 continue;
                             }
 
@@ -196,7 +215,12 @@ public class KojiMavenMetadataProvider
                             }
 
                             logger.debug( "Checking for builds/tags of: {}", archive );
-                            List<KojiTagInfo> tags = kojiClient.listTags( archive.getBuildId(), session );
+                            List<KojiTagInfo> tags = seenBuildTags.get( archive.getBuildId() );
+                            if ( tags == null )
+                            {
+                                tags = kojiClient.listTags( archive.getBuildId(), session );
+                                seenBuildTags.put( archive.getBuildId(), tags );
+                            }
 
                             boolean buildAllowed = false;
                             for ( KojiTagInfo tag : tags )
@@ -213,11 +237,14 @@ public class KojiMavenMetadataProvider
                                 }
                             }
 
-                            if ( buildAllowed && buildAuthority.isAuthorized( path, new EventMetadata(), ref, build, session ) )
+                            logger.debug(
+                                    "Checking if build passed tag whitelist check and doesn't collide with something in authority store (if configured)..." );
+
+                            if ( buildAllowed && buildAuthority.isAuthorized( path, new EventMetadata(), ref, build, session, seenBuildArchives ) )
                             {
                                 try
                                 {
-
+                                    logger.debug( "Adding version: {} for: {}", archive.getVersion(), path );
                                     versions.add( VersionUtils.createSingleVersion( archive.getVersion() ) );
                                 }
                                 catch ( InvalidVersionSpecificationException e )
@@ -231,6 +258,7 @@ public class KojiMavenMetadataProvider
 
                         if ( versions.isEmpty() )
                         {
+                            logger.debug( "No versions found in Koji builds for metadata: {}", path );
                             return null;
                         }
 
@@ -277,7 +305,6 @@ public class KojiMavenMetadataProvider
         }
         catch ( InterruptedException e )
         {
-            Logger logger = LoggerFactory.getLogger( getClass() );
             logger.warn( "Interrupted waiting for Koji GA version metadata lock on target: {}", ga );
         }
         finally
@@ -285,6 +312,7 @@ public class KojiMavenMetadataProvider
             lock.unlock();
         }
 
+        logger.debug( "Returning null metadata result for unknown reason (path: '{}')", path );
         return null;
     }
 }
