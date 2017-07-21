@@ -26,8 +26,15 @@ import org.commonjava.indy.conf.DefaultIndyConfiguration;
 import org.commonjava.maven.galley.model.ConcreteResource;
 import org.commonjava.maven.galley.model.Location;
 import org.commonjava.maven.galley.model.SimpleLocation;
+import org.jboss.byteman.contrib.bmunit.BMRule;
+import org.jboss.byteman.contrib.bmunit.BMRules;
+import org.jboss.byteman.contrib.bmunit.BMUnitConfig;
+import org.jboss.byteman.contrib.bmunit.BMUnitRunner;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 
+@RunWith(BMUnitRunner.class)
+@BMUnitConfig( debug = true )
 public class ExpiringMemoryNotFoundCacheTest
 {
 
@@ -54,6 +61,42 @@ public class ExpiringMemoryNotFoundCacheTest
 
         final Map<Location, Set<String>> allMissing = nfc.getAllMissing();
         assertThat( allMissing == null || allMissing.isEmpty(), equalTo( true ) );
+    }
+
+    @Test
+    @BMRules( rules = {
+                    @BMRule( name = "ThreadOne is running", targetClass =
+                                    "org.commonjava.indy.core.inject.ExpiringMemoryNotFoundCache",
+                                    targetMethod = "addMissing(org.commonjava.maven.galley.model.ConcreteResource)",
+                                    targetLocation = "ENTRY",
+                                    action = "debug(\"befor one\"); "
+                                                    + "waitFor(\"waiting thread tow\");  "
+                                                    + "debug(\"end for one!\")" ),
+                    @BMRule( name = "ThreadTwo is running", targetClass =
+                                    "org.commonjava.indy.core.inject.ExpiringMemoryNotFoundCache",
+                                    targetMethod = "clearAllMissing", targetLocation = "ENTRY",
+                                    action = " debug(\"before two\"); "
+                                                    + "signalWake(\"waiting thread tow\", true); "
+                                                    + "debug(\"end for two!\")" ) } )
+    public void nfcConcurentModificationExceptionTest() throws InterruptedException
+    {
+        final DefaultIndyConfiguration config = new DefaultIndyConfiguration();
+        config.setNotFoundCacheTimeoutSeconds( 1 );
+
+        final ExpiringMemoryNotFoundCache nfc = new ExpiringMemoryNotFoundCache( config );
+
+        final ConcreteResource res =
+                        new ConcreteResource( new SimpleLocation( "test:uri" ), "/path/to/expired/object" );
+
+        ExpiringMemoryNotFoundCacheAddmissThread expiringMemoryNotFoundCacheAddmissThread =
+                        new ExpiringMemoryNotFoundCacheAddmissThread( nfc, res );
+        ExpiringMemoryNotFoundCacheClearThread expiringMemoryNotFoundCacheClearThread =
+                        new ExpiringMemoryNotFoundCacheClearThread( nfc );
+        new Thread( expiringMemoryNotFoundCacheAddmissThread ).start();
+        Thread.sleep( 100 );
+        new Thread( expiringMemoryNotFoundCacheClearThread ).start();
+
+        Thread.sleep( 800 );
     }
 
     @Test
